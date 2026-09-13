@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -21,6 +22,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -30,6 +32,17 @@ from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn
 from xml.parsers.expat import ExpatError
+
+try:
+    from . import runtime_pack_contract
+except ImportError:  # Direct execution from a sealed runtime verifier snapshot.
+    _runtime_pack_spec = importlib.util.spec_from_file_location(
+        "runtime_pack_contract", Path(__file__).with_name("runtime_pack_contract.py")
+    )
+    if _runtime_pack_spec is None or _runtime_pack_spec.loader is None:
+        raise
+    runtime_pack_contract = importlib.util.module_from_spec(_runtime_pack_spec)
+    _runtime_pack_spec.loader.exec_module(runtime_pack_contract)
 
 MODULE_SCHEMA = "io.vetcoders.vibecrafted.module.v1"
 ASSEMBLY_SCHEMA = "io.vetcoders.vibecrafted.module-assembly.v1"
@@ -99,7 +112,7 @@ RUNTIME_GENERATION_MANIFEST_NAME = "runtime-manifest.json"
 SOURCE_PROVENANCE_NAME = "source-provenance.json"
 SOURCE_PROVENANCE_SCHEMA = "vibecrafted.source-provenance.v2"
 SOURCE_PAYLOAD_SCHEMA = "vibecrafted.distribution-tree.v1"
-RUNTIME_GENERATION_ENTRYPOINT = "vibecrafted-core/vibecrafted_core/deck/vibecrafted"
+RUNTIME_GENERATION_ENTRYPOINT = "bin/vibecrafted"
 RUNTIME_GENERATION_PROJECTED_CONFIG = "runtime/generated/vc-frame/config.kdl"
 RUNTIME_GENERATION_CANONICAL_CONFIG = (
     "vibecrafted-core/vibecrafted_core/runtime/generated/vc-frame/config.kdl"
@@ -107,10 +120,14 @@ RUNTIME_GENERATION_CANONICAL_CONFIG = (
 RUNTIME_GENERATION_REQUIRED_HASHES = frozenset(
     {
         "VERSION",
+        "scripts/distribution_manifest.py",
+        "scripts/installer_brand.py",
         "scripts/vibecrafted",
+        "scripts/vetcoders_install.py",
         RUNTIME_GENERATION_CANONICAL_CONFIG,
         RUNTIME_GENERATION_ENTRYPOINT,
         "vibecrafted-core/vibecrafted_core/product_contract.py",
+        "vibecrafted-core/vibecrafted_core/runtime_pack_contract.py",
         "vibecrafted-core/vibecrafted_core/walkaround_runner.py",
         "vibecrafted-core/vibecrafted_core/schemas/unified_product.schema.v1.json",
         "vibecrafted-core/vibecrafted_core/trust/release-policy.v1.json",
@@ -159,6 +176,15 @@ _EMBEDDED_DOCUMENTATION_PATHS = {
         }
     ),
 }
+_VENDORED_OPENSSL_RELATIVE_SUFFIXES = (
+    "/lib/libssl.3.dylib",
+    "/lib/libcrypto.3.dylib",
+)
+_VENDORED_OPENSSL_HOST_PREFIXES = (
+    "/opt/homebrew/Cellar/openssl@3/",
+    "/opt/homebrew/etc/openssl@3",
+    "/opt/homebrew/opt/openssl@3/",
+)
 _FILE_KINDS = frozenset({"executable", "dylib", "resource", "config"})
 _APP_ENTRYPOINTS = frozenset({"app", "terminal", "frame"})
 _WALKAROUND_CHECKS = frozenset(
@@ -204,6 +230,7 @@ _LAUNCH_PRIMARY_SHELL = (
 _TERMINAL_HELPER_APP = "Contents/Helpers/vc-terminal.app"
 _TERMINAL_HELPER_BUNDLE_ID = "io.vetcoders.vc-terminal"
 _TERMINAL_HELPER_ICON = "alacritty.icns"
+_TERMINAL_HELPER_DISPLAY_NAME = "VC Terminal"
 PRODUCT_MANIFEST_REFERENT = "manifests/product-manifest.json"
 RUNTIME_MANIFEST_REFERENT = "manifests/runtime-manifest.json"
 _MAX_SIGNED_PAYLOAD_BYTES = 64 * 1024 * 1024
@@ -1152,6 +1179,18 @@ def _verify_macho_closure(
         _fail(E_DEPENDENCY, f"unreachable declared dylibs: {', '.join(unreachable)}")
 
 
+def _vendored_openssl_host_path(relative: str, host_path: str) -> bool:
+    """True for compiled-in OPENSSLDIR/ENGINESDIR of the pinned OpenSSL dylibs.
+
+    After install_name_tool the load commands are @loader_path. Remaining
+    /opt/homebrew strings are OpenSSL's default config/cert directories, not
+    this build's first-party payload. /Users paths are never accepted here.
+    """
+    if not relative.endswith(_VENDORED_OPENSSL_RELATIVE_SUFFIXES):
+        return False
+    return host_path.startswith(_VENDORED_OPENSSL_HOST_PREFIXES)
+
+
 def _reject_host_bound_paths(path: Path, *, relative: str, kind: str) -> None:
     """Reject payload bytes that silently bind a module to the build host."""
     if kind == "resource":
@@ -1164,6 +1203,8 @@ def _reject_host_bound_paths(path: Path, *, relative: str, kind: str) -> None:
     for match in _BUILD_HOST_PATH_RE.finditer(content):
         host_path = match.group("path").decode("utf-8", errors="replace")
         if host_path in documentation_paths:
+            continue
+        if _vendored_openssl_host_path(relative, host_path):
             continue
         _fail(
             E_PATH,
@@ -2071,6 +2112,10 @@ def verify_app(app_path: str | Path, *, require_clean: bool = False) -> dict[str
         _fail(E_BUNDLE, "terminal helper executable is not canonical")
     if helper_plist.get("CFBundleIconFile") != _TERMINAL_HELPER_ICON:
         _fail(E_BUNDLE, "terminal helper icon is not canonical")
+    if helper_plist.get("CFBundleDisplayName") != _TERMINAL_HELPER_DISPLAY_NAME:
+        _fail(E_BUNDLE, "terminal helper display name is not canonical")
+    if helper_plist.get("CFBundleName") != _TERMINAL_HELPER_DISPLAY_NAME:
+        _fail(E_BUNDLE, "terminal helper bundle name is not canonical")
     helper_icon_relative = (
         f"{_TERMINAL_HELPER_APP}/Contents/Resources/{_TERMINAL_HELPER_ICON}"
     )
@@ -2294,6 +2339,47 @@ def _mounted_release_dmg(dmg: Path):
             )
 
 
+@contextmanager
+def _extracted_runtime_pack(carrier: Path):
+    """Extract a verified Runtime Pack without accepting archive aliases or links."""
+
+    with tempfile.TemporaryDirectory(prefix="vibecrafted-runtime-pack-proof-") as raw:
+        destination = Path(raw)
+        with tarfile.open(carrier, "r:gz") as archive:
+            members = archive.getmembers()
+            roots: set[str] = set()
+            for member in members:
+                pure = PurePosixPath(member.name)
+                if (
+                    pure.is_absolute()
+                    or ".." in pure.parts
+                    or not pure.parts
+                    or member.issym()
+                    or member.islnk()
+                    or not (member.isdir() or member.isfile())
+                ):
+                    _fail(E_PROOF, "Runtime Pack archive contains an unsafe member")
+                roots.add(pure.parts[0])
+            if roots != {"VibecraftedRuntime"}:
+                _fail(E_PROOF, "Runtime Pack archive must contain one canonical root")
+            for member in members:
+                target = destination.joinpath(*PurePosixPath(member.name).parts)
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    _fail(E_PROOF, "Runtime Pack member cannot be read")
+                with target.open("xb") as handle:
+                    shutil.copyfileobj(source, handle)
+                target.chmod(member.mode & 0o777)
+        root = destination / "VibecraftedRuntime"
+        if any(path.is_symlink() for path in root.rglob("*")):
+            _fail(E_PROOF, "Runtime Pack extraction produced a symlink")
+        yield root
+
+
 def _verify_release_artifacts(
     payload: Mapping[str, Any],
     *,
@@ -2381,6 +2467,66 @@ def _verify_release_artifacts(
     }
     if payload["source_revisions"] != expected_revisions:
         _fail(E_PROOF, "release output source revisions do not match the product")
+
+    runtime_pack = payload["runtime_pack"]
+    pack_name = runtime_pack["path"]
+    expected_pack_prefix = f"Vibecrafted_RuntimePack_{product['version']}-"
+    expected_pack_suffix = (
+        f"-{product['git_sha'][:8]}-darwin-{product['architecture']}.tar.gz"
+    )
+    if (
+        Path(pack_name).name != pack_name
+        or not pack_name.startswith(expected_pack_prefix)
+        or not pack_name.endswith(expected_pack_suffix)
+    ):
+        _fail(E_PROOF, "Runtime Pack basename does not bind the release source")
+    carrier = _release_relative_path(receipt_root, pack_name, field="runtime_pack.path")
+    if not carrier.is_file() or carrier.is_symlink():
+        _fail(E_MISSING, "standalone Runtime Pack is missing")
+    if runtime_pack["size"] != carrier.stat().st_size or runtime_pack[
+        "sha256"
+    ] != _sha256(carrier):
+        _fail(E_HASH, "standalone Runtime Pack bytes disagree with release output")
+    embedded_relative = _relative_path(
+        runtime_pack["embedded_path"], field="runtime_pack.embedded_path"
+    ).as_posix()
+    if embedded_relative != f"Contents/Resources/runtime-pack/{pack_name}":
+        _fail(E_PROOF, "App-embedded Runtime Pack path is not canonical")
+    embedded = app / embedded_relative
+    if (
+        not embedded.is_file()
+        or embedded.is_symlink()
+        or embedded.stat().st_size != carrier.stat().st_size
+        or _sha256(embedded) != runtime_pack["sha256"]
+    ):
+        _fail(E_HASH, "App-embedded Runtime Pack differs from the standalone carrier")
+    provenance_receipt = runtime_pack["provenance"]
+    if provenance_receipt["source_revisions"] != expected_revisions:
+        _fail(E_PROOF, "Runtime Pack receipt donor tuple disagrees with the product")
+    with _extracted_runtime_pack(carrier) as pack_root:
+        try:
+            provenance = runtime_pack_contract.verify_provenance(
+                pack_root,
+                carrier_basename=pack_name,
+                expected_source_revision=expected_revisions["vibecrafted"],
+                expected_terminal_revision=expected_revisions["vc-terminal"],
+                expected_frame_revision=expected_revisions["vc-frame"],
+            )
+        except runtime_pack_contract.RuntimePackContractError as exc:
+            _fail(E_PROOF, str(exc))
+        provenance_path = pack_root / runtime_pack_contract.PROVENANCE_NAME
+        if provenance_receipt != {
+            "path": runtime_pack_contract.PROVENANCE_NAME,
+            "sha256": _sha256(provenance_path),
+            "version": provenance["version"],
+            "platform": provenance["platform"],
+            "architecture": provenance["architecture"],
+            "source_revisions": provenance["source_revisions"],
+        }:
+            _fail(
+                E_PROOF,
+                "Runtime Pack internal provenance disagrees with release output",
+            )
     if require_walkaround:
         return _run_walkaround_probes(app, dmg)
     return _run_live_release_checks(app, dmg)
@@ -3808,6 +3954,8 @@ def _self_test() -> int:
                     "CFBundleIdentifier": "io.vetcoders.vc-terminal",
                     "CFBundleExecutable": "alacritty",
                     "CFBundleIconFile": "alacritty.icns",
+                    "CFBundleName": "VC Terminal",
+                    "CFBundleDisplayName": "VC Terminal",
                     "CFBundlePackageType": "APPL",
                 },
                 handle,
@@ -4003,7 +4151,7 @@ def _self_test() -> int:
                     "tree_sha256": "f" * 64,
                     "entry_count": 42,
                 },
-                "entrypoint": "vibecrafted-core/vibecrafted_core/deck/vibecrafted",
+                "entrypoint": RUNTIME_GENERATION_ENTRYPOINT,
                 "hashes": {
                     relative: f"{index:x}" * 64
                     for index, relative in enumerate(
